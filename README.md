@@ -1,5 +1,5 @@
 # AutoReservoir
-An Arduino controller for my water reservoir. It will automatically fill the reservoir from a water tap, when the water level reaches bottom. It updates HomeSeer with valve status, total litres filled this session. If the water supply should be turned off, when the valve is open, it will alert both visually and send an alert to HomeSeer. Inspired by [https://www.youtube.com/channel/UCCCjEjIPlWF-rBMZyOga6gQ](https://www.youtube.com/channel/UCCCjEjIPlWF-rBMZyOga6gQ "Devin Olsen")
+An Arduino controller for my water reservoir. It will automatically fill the reservoir from a water tap, when the water level reaches bottom. It updates HomeSeer with valve status, total litres filled this session. If the water supply should be turned off, when the valve is open, it will alert both visually and send an alert to HomeSeer. Inspired by [Devin Olsen]([https://www.youtube.com/channel/UCCCjEjIPlWF-rBMZyOga6gQ](https://www.youtube.com/channel/UCCCjEjIPlWF-rBMZyOga6gQ "Devin Olsen")
 
 ## Parts list
 * Arduino Nano with Ethernet shield
