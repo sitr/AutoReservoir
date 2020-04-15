@@ -6,16 +6,19 @@ const short topSensorPin = 9;
 const short bottomSensorPin = 8;
 const short flowMeterPin = 2;
 const short relayPin = 5;
-const short alarmNoFlowPin = 13;
+const short alarmNoFlowPin = 6;
+const short temperatureProbePin = A0;
 
 float calibrationFactorFlow = 4.5;
 byte sensorInterrupt = 0;
 volatile byte pulseCount;
-
 float flowRate;
 unsigned int flowMilliLitres;
 unsigned long totalMilliLitres;
-unsigned long oldTime;
+unsigned long previousFlowSensorMillis;
+
+unsigned long previousTemperatureSensorMillis;
+const int temperatureSensorInterval = 5* 60 * 1000;
 
 byte mac[] = { 0xDE, 0xAC, 0xEE, 0xEF, 0xFE, 0xED };
 IPAddress ip(192, 168, 86, 230);
@@ -29,6 +32,20 @@ int reservoirWaterInletId = 1426;
 int flowRateId = 1428;
 int totalVolumeId = 1429;
 
+#define THERMISTORPIN A0         
+// resistance at 25 degrees C
+#define THERMISTORNOMINAL 10000      
+// temp. for nominal resistance (almost always 25 C)
+#define TEMPERATURENOMINAL 25   
+// how many samples to take and average, more takes longer
+// but is more 'smooth'
+#define NUMSAMPLES 5
+// The beta coefficient of the thermistor (usually 3000-4000)
+#define BCOEFFICIENT 3950
+// the value of the 'other' resistor
+#define SERIESRESISTOR 10000
+int samples[NUMSAMPLES];
+
 bool fillValveOpen = false;
 
 void setup()
@@ -37,15 +54,17 @@ void setup()
     pinMode(bottomSensorPin, INPUT);
     pinMode(flowMeterPin, INPUT);
     digitalWrite(flowMeterPin, HIGH);
-    pinMode(LED_BUILTIN, OUTPUT);
+    pinMode(alarmNoFlowPin, OUTPUT);
     pinMode(relayPin, OUTPUT);
 
-    pulseCount        = 0;
-    flowRate          = 0.0;
-    flowMilliLitres   = 0;
-    totalMilliLitres  = 0;
-    oldTime           = 0;
-
+    pulseCount = 0;
+    flowRate = 0.0;
+    flowMilliLitres = 0;
+    totalMilliLitres = 0;
+    previousFlowSensorMillis = 0;
+    previousTemperatureSensorMillis = 0;
+    
+    analogReference(EXTERNAL);
     Serial.begin(9600);
     while (!Serial) continue;
     setupEthernet();
@@ -54,7 +73,13 @@ void setup()
 }
 
 void loop() {
+    checkWaterLevel();
+    if(fillValveOpen)
+        checkWaterFlow();
+    checkTemperature();
+}
 
+void checkWaterLevel() {
     int topValue = digitalRead(topSensorPin);
     int bottomValue = digitalRead(bottomSensorPin);
 
@@ -80,8 +105,6 @@ void loop() {
             fillValveOpen = true;
         }
     }
-    if(fillValveOpen)
-        checkWaterFlow();
 }
 
 void setupEthernet() {
@@ -102,6 +125,43 @@ void setupEthernet() {
     else {
         Serial.print("DHCP assigned IP ");
         Serial.println(Ethernet.localIP());
+    }
+}
+
+void checkTemperature() {
+    if((millis() - previousTemperatureSensorMillis) > temperatureSensorInterval) {
+        uint8_t i;
+        float average;
+        
+        // take N samples in a row, with a slight delay
+        for (i=0; i< NUMSAMPLES; i++) {
+            samples[i] = analogRead(THERMISTORPIN);
+            delay(10);
+        }
+        
+        // average all the samples out
+        average = 0;
+        for (i=0; i< NUMSAMPLES; i++) {
+            average += samples[i];
+        }
+        average /= NUMSAMPLES;
+        
+        // convert the value to resistance
+        average = 1023 / average - 1;
+        average = SERIESRESISTOR / average;
+        
+        float steinhart;
+        steinhart = average / THERMISTORNOMINAL;     // (R/Ro)
+        steinhart = log(steinhart);                  // ln(R/Ro)
+        steinhart /= BCOEFFICIENT;                   // 1/B * ln(R/Ro)
+        steinhart += 1.0 / (TEMPERATURENOMINAL + 273.15); // + (1/To)
+        steinhart = 1.0 / steinhart;                 // Invert
+        steinhart -= 273.15;                         // convert to C
+        Serial.print("Temperature "); 
+        Serial.print(steinhart);
+        Serial.println(" *C");
+        updateHomeSeer(1432, steinhart);
+        previousTemperatureSensorMillis = millis();
     }
 }
 
@@ -155,8 +215,10 @@ bool skipResponseHeaders() {
 	return ok;
 }
 
-bool sendRequest(int deviceId, int statusValue) {
-    String cmdPath = String("/JSON?request=controldevicebyvalue&ref=") + deviceId + "&value=" + statusValue;
+bool sendRequest(int deviceId, double statusValue) {
+    String stringValue = String(statusValue);
+    stringValue.replace(".", ",");
+    String cmdPath = String("/JSON?request=controldevicebyvalue&ref=") + deviceId + "&value=" + stringValue;
 
     Serial.print("Requesting URL: ");
     Serial.println(cmdPath);
@@ -166,7 +228,7 @@ bool sendRequest(int deviceId, int statusValue) {
 }
 
 void checkWaterFlow() {
-    if((millis() - oldTime) > 1000)    // Only process counters once per second
+    if((millis() - previousFlowSensorMillis) > 1000)    // Only process counters once per second
     { 
         // Disable the interrupt while calculating flow rate and sending the value to
         // the host
@@ -177,15 +239,15 @@ void checkWaterFlow() {
         // that to scale the output. We also apply the calibrationFactor to scale the output
         // based on the number of pulses per second per units of measure (litres/minute in
         // this case) coming from the sensor.
-        flowRate = ((1000.0 / (millis() - oldTime)) * pulseCount) / calibrationFactorFlow;
+        flowRate = ((1000.0 / (millis() - previousFlowSensorMillis)) * pulseCount) / calibrationFactorFlow;
         if((int)flowRate == 0)
         {
-            digitalWrite(LED_BUILTIN, HIGH);
+            digitalWrite(alarmNoFlowPin, HIGH);
             updateHomeSeer(reservoirWaterInletId, 100);
         }
         else
         {
-            digitalWrite(LED_BUILTIN, LOW);
+            digitalWrite(alarmNoFlowPin, LOW);
             updateHomeSeer(reservoirWaterInletId, 0);
         }
         
@@ -193,7 +255,7 @@ void checkWaterFlow() {
         // disabled interrupts the millis() function won't actually be incrementing right
         // at this point, but it will still return the value it was set to just before
         // interrupts went away.
-        oldTime = millis();
+        previousFlowSensorMillis = millis();
         
         // Divide the flow rate in litres/minute by 60 to determine how many litres have
         // passed through the sensor in this 1 second interval, then multiply by 1000 to
