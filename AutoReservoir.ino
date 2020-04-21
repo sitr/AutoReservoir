@@ -15,22 +15,29 @@ volatile byte pulseCount;
 float flowRate;
 unsigned int flowMilliLitres;
 unsigned long totalMilliLitres;
+
 unsigned long previousFlowSensorMillis;
 
 unsigned long previousTemperatureSensorMillis;
-const int temperatureSensorInterval = 5* 60 * 1000;
+const long temperatureSensorInterval = 60*1000L;
+
+unsigned long previousAliveMillis;
+const long aliveInterval = 3*60*1000L;
 
 byte mac[] = { 0xDE, 0xAC, 0xEE, 0xEF, 0xFE, 0xED };
 IPAddress ip(192, 168, 86, 230);
 IPAddress dnsServer(192, 168, 86, 1);
 IPAddress homeSeerServer(192, 168, 86, 44);
 EthernetClient client;
+
 const unsigned long HTTP_TIMEOUT = 10000;
 
 int reservoirValveId = 1425;
 int reservoirWaterInletId = 1426;
 int flowRateId = 1428;
 int totalVolumeId = 1429;
+int reservoirTemperatureId = 1432;
+int reservoirControllerId = 1427;
 
 #define THERMISTORPIN A0         
 // resistance at 25 degrees C
@@ -63,6 +70,7 @@ void setup()
     totalMilliLitres = 0;
     previousFlowSensorMillis = 0;
     previousTemperatureSensorMillis = 0;
+    previousAliveMillis = 0;
     
     analogReference(EXTERNAL);
     Serial.begin(9600);
@@ -77,6 +85,7 @@ void loop() {
     if(fillValveOpen)
         checkWaterFlow();
     checkTemperature();
+    sendAlive();
 }
 
 void checkWaterLevel() {
@@ -92,6 +101,8 @@ void checkWaterLevel() {
             updateHomeSeer(reservoirValveId, 0);
             updateHomeSeer(reservoirWaterInletId, 0);
             fillValveOpen = false;
+            //Reset possible alarms on water flow
+            digitalWrite(alarmNoFlowPin, LOW);
         }
     }
 
@@ -128,8 +139,15 @@ void setupEthernet() {
     }
 }
 
+void sendAlive() {
+    if(millis() - previousAliveMillis >= aliveInterval) {
+        previousAliveMillis += aliveInterval;
+        updateHomeSeer(reservoirControllerId, 100);
+    }
+}
+
 void checkTemperature() {
-    if((millis() - previousTemperatureSensorMillis) > temperatureSensorInterval) {
+    if(millis() - previousTemperatureSensorMillis >= temperatureSensorInterval) {
         uint8_t i;
         float average;
         
@@ -160,8 +178,8 @@ void checkTemperature() {
         Serial.print("Temperature "); 
         Serial.print(steinhart);
         Serial.println(" *C");
-        updateHomeSeer(1432, steinhart);
-        previousTemperatureSensorMillis = millis();
+        previousTemperatureSensorMillis += temperatureSensorInterval;
+        updateHomeSeer(reservoirTemperatureId, steinhart);
     }
 }
 
@@ -228,7 +246,7 @@ bool sendRequest(int deviceId, double statusValue) {
 }
 
 void checkWaterFlow() {
-    if((millis() - previousFlowSensorMillis) > 1000)    // Only process counters once per second
+    if(millis() - previousFlowSensorMillis > 1000)    // Only process counters once per second
     { 
         // Disable the interrupt while calculating flow rate and sending the value to
         // the host
