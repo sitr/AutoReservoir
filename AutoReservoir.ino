@@ -1,13 +1,13 @@
-#include <Ethernet.h>
-#include <SPI.h>
-#include <ArduinoJson.h>
+#include <HomeSeerClient.h>
 
-const short topSensorPin = 9;
-const short bottomSensorPin = 8;
-const short flowMeterPin = 2;
-const short relayPin = 5;
-const short alarmNoFlowPin = 6;
 const short temperatureProbePin = A0;
+const short flowMeterPin = 2;
+const short bucketWaterLevelPin = 3;
+const short reservoirInletValvePin = 5;
+const short alarmNoFlowPin = 6;
+const short bucketReservoirValvePin = 7;
+const short bottomSensorPin = 22;
+const short topSensorPin = 23;
 
 float calibrationFactorFlow = 4.5;
 byte sensorInterrupt = 0;
@@ -19,29 +19,31 @@ unsigned long totalMilliLitres;
 unsigned long previousFlowSensorMillis;
 
 unsigned long previousTemperatureSensorMillis;
-const long temperatureSensorInterval = 60*1000L;
+const long temperatureSensorInterval = 10*60*1000L;
+
+unsigned long previousBucketLevelMillis;
+const long bucketLevelInterval = 5*1000L;
 
 unsigned long previousAliveMillis;
 const long aliveInterval = 3*60*1000L;
 
-byte mac[] = { 0xDE, 0xAC, 0xEE, 0xEF, 0xFE, 0xED };
-IPAddress ip(192, 168, 86, 230);
-IPAddress dnsServer(192, 168, 86, 1);
-IPAddress homeSeerServer(192, 168, 86, 44);
-EthernetClient client;
+unsigned long previousReservoirLevelMillis;
+const long reservoirLevelInterval = 5*1000L;
 
-const unsigned long HTTP_TIMEOUT = 10000;
+HomeSeerClient homeSeerClient;
 
-int reservoirValveId = 1425;
-int reservoirWaterInletId = 1426;
-int flowRateId = 1428;
-int totalVolumeId = 1429;
-int reservoirTemperatureId = 1432;
-int reservoirControllerId = 1427;
+// HomeSeer id's
+const int reservoirValveId = 1425;
+const int reservoirWaterInletId = 1426;
+const int flowRateId = 1428;
+const int totalVolumeId = 1429;
+const int reservoirTemperatureId = 1432;
+const int reservoirControllerId = 1427;
+const int bucketReservoirId = 2056;
 
-#define THERMISTORPIN A0         
+#define THERMISTORPIN A0
 // resistance at 25 degrees C
-#define THERMISTORNOMINAL 10000      
+#define THERMISTORNOMINAL 10000
 // temp. for nominal resistance (almost always 25 C)
 #define TEMPERATURENOMINAL 25   
 // how many samples to take and average, more takes longer
@@ -54,95 +56,117 @@ int reservoirControllerId = 1427;
 int samples[NUMSAMPLES];
 
 bool fillValveOpen = false;
+bool reservoirStatusUpdatedInHS = false;
+int topValue = 0;
+int bottomValue = 0;
 
 void setup()
 {
     pinMode(topSensorPin, INPUT);
     pinMode(bottomSensorPin, INPUT);
+    
     pinMode(flowMeterPin, INPUT);
     digitalWrite(flowMeterPin, HIGH);
+    
     pinMode(alarmNoFlowPin, OUTPUT);
-    pinMode(relayPin, OUTPUT);
+    digitalWrite(alarmNoFlowPin, LOW);
+    
+    pinMode(reservoirInletValvePin, OUTPUT);
+    digitalWrite(reservoirInletValvePin, HIGH);
 
+    pinMode(bucketReservoirValvePin, OUTPUT);
+    digitalWrite(bucketReservoirValvePin, HIGH);
+
+    pinMode(bucketWaterLevelPin, INPUT);
+    
     pulseCount = 0;
     flowRate = 0.0;
     flowMilliLitres = 0;
     totalMilliLitres = 0;
+    previousReservoirLevelMillis = 0;
     previousFlowSensorMillis = 0;
     previousTemperatureSensorMillis = 0;
     previousAliveMillis = 0;
-    
+    previousBucketLevelMillis = 0;
+
     analogReference(EXTERNAL);
     Serial.begin(9600);
     while (!Serial) continue;
-    setupEthernet();
-    client.setTimeout(HTTP_TIMEOUT);
+
+    homeSeerClient.init();
     attachInterrupt(sensorInterrupt, pulseCounter, FALLING);
+    delay(10000);
 }
 
 void loop() {
-    checkWaterLevel();
+    checkReservoirLevel();
     if(fillValveOpen)
         checkWaterFlow();
+    checkBucketLevel();
     checkTemperature();
     sendAlive();
 }
 
-void checkWaterLevel() {
-    int topValue = digitalRead(topSensorPin);
-    int bottomValue = digitalRead(bottomSensorPin);
+void checkBucketLevel() {
+    if(millis() - previousBucketLevelMillis >= bucketLevelInterval) {
+        bool bucketEmpty = digitalRead(bucketWaterLevelPin);
 
-    if (topValue == LOW && bottomValue == HIGH)
-    {
-        if(fillValveOpen)
+        if(bucketEmpty == true)
         {
-            // Close valve
-            digitalWrite(relayPin, LOW);
-            updateHomeSeer(reservoirValveId, 0);
-            updateHomeSeer(reservoirWaterInletId, 0);
-            fillValveOpen = false;
-            //Reset possible alarms on water flow
-            digitalWrite(alarmNoFlowPin, LOW);
+            digitalWrite(bucketReservoirValvePin, LOW);
+            homeSeerClient.updateHomeSeer(bucketReservoirId, 100);
         }
-    }
-
-    if (topValue == HIGH && bottomValue == LOW)
-    {
-        if(!fillValveOpen)
+        else
         {
-            // Open valve
-            digitalWrite(relayPin, HIGH);
-            updateHomeSeer(reservoirValveId, 100);
-            fillValveOpen = true;
+            digitalWrite(bucketReservoirValvePin, HIGH);
+            homeSeerClient.updateHomeSeer(bucketReservoirId, 0);
         }
+        previousBucketLevelMillis += bucketLevelInterval;
     }
 }
 
-void setupEthernet() {
-    Serial.println("Initialize Ethernet with DHCP:");
-    if (Ethernet.begin(mac) == 0) {
-        Serial.println("Failed to configure Ethernet using DHCP");
-        if (Ethernet.hardwareStatus() == EthernetNoHardware){
-            Serial.println("Ethernet shield was not found.  Sorry, can't run without hardware. :(");
-            while (true) {
-                delay(1);
+void checkReservoirLevel() {
+    if(millis() - previousReservoirLevelMillis >= reservoirLevelInterval) {
+        topValue = digitalRead(topSensorPin);
+        delay(200);
+        bottomValue = digitalRead(bottomSensorPin);
+
+        if (topValue == LOW && bottomValue == HIGH)
+        {
+            if(fillValveOpen)
+            {
+                // Close valve
+                digitalWrite(reservoirInletValvePin, HIGH);
+                homeSeerClient.updateHomeSeer(reservoirValveId, 0);
+                homeSeerClient.updateHomeSeer(reservoirWaterInletId, 0);
+                fillValveOpen = false;
+                //Reset possible alarms on water flow
+                digitalWrite(alarmNoFlowPin, LOW);
             }
         }
-        if (Ethernet.linkStatus() == LinkOFF) {
-            Serial.println("Ethernet cable is not connected.");
+
+        if (topValue == HIGH && bottomValue == LOW)
+        {
+            if(!fillValveOpen)
+            {
+                // Open valve
+                digitalWrite(reservoirInletValvePin, LOW);
+                if(!reservoirStatusUpdatedInHS) {
+                    homeSeerClient.updateHomeSeer(reservoirValveId, 100);
+                    homeSeerClient.updateHomeSeer(reservoirWaterInletId, 100);
+                }
+                reservoirStatusUpdatedInHS = true;
+                fillValveOpen = true;
+            }
         }
-        Ethernet.begin(mac, ip, dnsServer);
-    } 
-    else {
-        Serial.print("DHCP assigned IP ");
-        Serial.println(Ethernet.localIP());
+        previousReservoirLevelMillis += reservoirLevelInterval;
     }
 }
 
 void sendAlive() {
     if(millis() - previousAliveMillis >= aliveInterval) {
         previousAliveMillis += aliveInterval;
-        updateHomeSeer(reservoirControllerId, 100);
+        homeSeerClient.updateHomeSeer(reservoirControllerId, 100);
     }
 }
 
@@ -179,70 +203,9 @@ void checkTemperature() {
         Serial.print(steinhart);
         Serial.println(" *C");
         previousTemperatureSensorMillis += temperatureSensorInterval;
-        updateHomeSeer(reservoirTemperatureId, steinhart);
+        homeSeerClient.updateHomeSeer(reservoirTemperatureId, steinhart);
+        delay(1000);
     }
-}
-
-bool connect() {
-    Serial.print("Connect to ");
-    Serial.println(homeSeerServer);
-
-    bool ok = client.connect(homeSeerServer, 80);
-
-    Serial.println(ok ? "Connected" : "Connection Failed!");
-    return ok;
-}
-
-void disconnect() {
-	Serial.println("Disconnect");
-	client.stop();
-}
-
-void updateHomeSeer(int deviceId, double deviceValue) {
-    if (connect()) {
-        if (sendRequest(deviceId, deviceValue)) {
-            if (readReponseContent()) {
-                Serial.println("HomeSeer updated");
-            }
-        }
-    }
-    disconnect();
-}
-
-bool readReponseContent() {
-      // Check HTTP status
-    char status[32] = {0};
-    client.readBytesUntil('\r', status, sizeof(status));
-    if (strcmp(status, "HTTP/1.0 200 OK") != 0) {
-        Serial.print(F("Unexpected response: "));
-        Serial.println(status);
-        return false;
-    }
-	return true;
-}
-
-// Skip HTTP headers so that we are at the beginning of the response's body
-bool skipResponseHeaders() {
-	// HTTP headers end with an empty line
-	char endOfHeaders[] = "\r\n\r\n";
-	bool ok = client.find(endOfHeaders);
-
-	if (!ok) {
-		Serial.println("No response or invalid response!");
-	}
-	return ok;
-}
-
-bool sendRequest(int deviceId, double statusValue) {
-    String stringValue = String(statusValue);
-    stringValue.replace(".", ",");
-    String cmdPath = String("/JSON?request=controldevicebyvalue&ref=") + deviceId + "&value=" + stringValue;
-
-    Serial.print("Requesting URL: ");
-    Serial.println(cmdPath);
-
-    client.print(String("GET ") + cmdPath + " HTTP/1.0\r\n" + "Connection: close\r\n\r\n");
-    return true;
 }
 
 void checkWaterFlow() {
@@ -261,12 +224,12 @@ void checkWaterFlow() {
         if((int)flowRate == 0)
         {
             digitalWrite(alarmNoFlowPin, HIGH);
-            updateHomeSeer(reservoirWaterInletId, 100);
+            homeSeerClient.updateHomeSeer(reservoirWaterInletId, 100);
         }
         else
         {
             digitalWrite(alarmNoFlowPin, LOW);
-            updateHomeSeer(reservoirWaterInletId, 0);
+            homeSeerClient.updateHomeSeer(reservoirWaterInletId, 0);
         }
         
         // Note the time this processing pass was executed. Note that because we've
@@ -284,19 +247,19 @@ void checkWaterFlow() {
         totalMilliLitres += flowMilliLitres;
         
         // Print the flow rate for this second in litres / minute
-        Serial.print("Flow rate: ");
-        Serial.print(int(flowRate));  // Print the integer part of the variable
-        Serial.print(" L/min");
-        Serial.print("\t"); 		  // Print tab space
-        updateHomeSeer(flowRateId, (int)flowRate);
+        // Serial.print("Flow rate: ");
+        // Serial.print(int(flowRate));  // Print the integer part of the variable
+        // Serial.print(" L/min");
+        // Serial.print("\t"); 		  // Print tab space
+        homeSeerClient.updateHomeSeer(flowRateId, (int)flowRate);
         // Print the cumulative total of litres flowed since starting
-        Serial.print("Output Liquid Quantity: ");        
-        Serial.print(totalMilliLitres);
-        Serial.println(" mL"); 
-        Serial.print("\t"); 		  // Print tab space
-        Serial.print(totalMilliLitres/1000);
-        Serial.print(" L");
-        updateHomeSeer(totalVolumeId, (int)totalMilliLitres/1000);
+        // Serial.print("Output Liquid Quantity: ");        
+        // Serial.print(totalMilliLitres);
+        // Serial.println(" mL"); 
+        // Serial.print("\t"); 		  // Print tab space
+        // Serial.print(totalMilliLitres/1000);
+        // Serial.print(" L");
+        homeSeerClient.updateHomeSeer(totalVolumeId, (int)totalMilliLitres/1000);
 
         // Reset the pulse counter so we can start incrementing again
         pulseCount = 0;
